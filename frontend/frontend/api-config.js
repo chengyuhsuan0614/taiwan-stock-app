@@ -2,4 +2,4 @@
 // Cloud mode: after Render gives you a backend URL, put it here.
 // Example:
 // window.STOCK_API_BASE = "https://taiwan-stock-api.onrender.com";
-window.STOCK_API_BASE = "";
+window.STOCK_API_BASE = "https://taiwan-stock-app-b7wt.onrender.com";
