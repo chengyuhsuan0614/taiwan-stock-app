@@ -3,7 +3,10 @@
 
 import csv
 import io
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from functools import lru_cache
+from urllib.parse import quote_plus
 
 import requests
 import yfinance as yf
@@ -74,6 +77,10 @@ STOCK_LIST_URLS = [
     "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
     "https://dts.twse.com.tw/opendata/t187ap03_O.csv",
 ]
+
+
+TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
+TWSE_MARGIN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
 
 
 def clean_stock_name(name: str) -> str:
@@ -155,9 +162,13 @@ def to_int(value, default=0):
     try:
         if value is None:
             return default
-        return int(value)
+        return int(float(str(value).replace(",", "")))
     except (TypeError, ValueError):
         return default
+
+
+def parse_twse_number(value) -> int:
+    return to_int(value, 0)
 
 
 def resolve_ticker(stock_code: str):
@@ -253,6 +264,169 @@ def build_intraday_history(ticker) -> list[dict]:
     return points
 
 
+def build_history(ticker, period: str, interval: str) -> list[dict]:
+    history = ticker.history(period=period, interval=interval)
+    points = []
+    for date, row in history.iterrows():
+        close = to_float(row["Close"])
+        if close <= 0:
+            continue
+        label = date.strftime("%m/%d") if interval == "1d" else date.strftime("%H:%M")
+        points.append({
+            "time": label,
+            "price": close,
+            "open": to_float(row["Open"]),
+            "high": to_float(row["High"]),
+            "low": to_float(row["Low"]),
+            "volume": to_int(row["Volume"]),
+        })
+    return points
+
+
+def get_news_items(symbol: str) -> list[dict]:
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(symbol)}&region=US&lang=en-US"
+    try:
+        response = requests.get(url, timeout=8)
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    except Exception:
+        return []
+
+    items = []
+    for item in root.findall("./channel/item")[:8]:
+        items.append({
+            "title": (item.findtext("title") or "").strip(),
+            "link": (item.findtext("link") or "").strip(),
+            "published": (item.findtext("pubDate") or "").strip(),
+            "source": "Yahoo Finance",
+        })
+    return items
+
+
+def get_company_events(ticker) -> list[dict]:
+    events = []
+
+    try:
+        calendar = ticker.calendar
+        if isinstance(calendar, dict):
+            for key, value in calendar.items():
+                events.append({
+                    "type": str(key),
+                    "date": str(value),
+                    "note": "Yahoo Finance calendar",
+                })
+        elif hasattr(calendar, "empty") and not calendar.empty:
+            for key, value in calendar.to_dict().items():
+                events.append({
+                    "type": str(key),
+                    "date": str(value),
+                    "note": "Yahoo Finance calendar",
+                })
+    except Exception:
+        pass
+
+    try:
+        earnings_dates = ticker.get_earnings_dates(limit=4)
+        if hasattr(earnings_dates, "iterrows"):
+            for date, row in earnings_dates.iterrows():
+                events.append({
+                    "type": "財報/法說相關日期",
+                    "date": date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date),
+                    "note": "Yahoo Finance earnings calendar",
+                })
+    except Exception:
+        pass
+
+    if not events:
+        events.append({
+            "type": "股東會 / 法說會",
+            "date": "目前資料源未提供",
+            "note": "之後可再串接公開資訊觀測站完整資料",
+        })
+
+    return events[:8]
+
+
+def recent_weekdays(days_back: int = 45) -> list[str]:
+    today = datetime.utcnow() + timedelta(hours=8)
+    dates = []
+    for i in range(days_back):
+        day = today - timedelta(days=i)
+        if day.weekday() < 5:
+            dates.append(day.strftime("%Y%m%d"))
+    return dates
+
+
+def twse_json(url: str, params: dict) -> dict:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, params=params, headers=headers, timeout=8)
+    response.raise_for_status()
+    return response.json()
+
+
+def row_to_dict(fields: list[str], row: list) -> dict:
+    return {fields[i]: row[i] for i in range(min(len(fields), len(row)))}
+
+
+def get_t86_for_date(date: str, stock_code: str) -> dict | None:
+    data = twse_json(TWSE_T86_URL, {
+        "date": date,
+        "selectType": "ALLBUT0999",
+        "response": "json",
+    })
+    fields = data.get("fields", [])
+    for row in data.get("data", []):
+        row_map = row_to_dict(fields, row)
+        if str(row_map.get("證券代號", "")).strip() == stock_code:
+            return {
+                "foreign": parse_twse_number(row_map.get("外陸資買賣超股數(不含外資自營商)")),
+                "investment_trust": parse_twse_number(row_map.get("投信買賣超股數")),
+            }
+    return None
+
+
+def get_margin_for_date(date: str, stock_code: str) -> dict | None:
+    data = twse_json(TWSE_MARGIN_URL, {
+        "date": date,
+        "selectType": "ALL",
+        "response": "json",
+    })
+    fields = data.get("fields", [])
+    for row in data.get("data", []):
+        row_map = row_to_dict(fields, row)
+        if str(row_map.get("股票代號", row_map.get("證券代號", ""))).strip() == stock_code:
+            return {
+                "margin_balance": parse_twse_number(row_map.get("今日餘額", row_map.get("融資今日餘額"))),
+                "margin_change": parse_twse_number(row_map.get("增減", row_map.get("融資增減"))),
+            }
+    return None
+
+
+def get_twse_flow_trend(stock_code: str) -> list[dict]:
+    points = []
+    for date in recent_weekdays():
+        if len(points) >= 20:
+            break
+        try:
+            t86 = get_t86_for_date(date, stock_code) or {}
+            margin = get_margin_for_date(date, stock_code) or {}
+        except Exception:
+            continue
+
+        if not t86 and not margin:
+            continue
+
+        points.append({
+            "date": f"{date[4:6]}/{date[6:8]}",
+            "foreign": t86.get("foreign", 0),
+            "investment_trust": t86.get("investment_trust", 0),
+            "margin_balance": margin.get("margin_balance", 0),
+            "margin_change": margin.get("margin_change", 0),
+        })
+
+    return list(reversed(points))
+
+
 # 建立 API 伺服器
 app = FastAPI()
 
@@ -338,6 +512,85 @@ def get_intraday(stock_code: str):
         "volume": quote["volume"],
         "points": points,
         "updated_at": points[-1]["time"] if points else "",
+    }
+
+
+@app.get("/stock/{stock_code}/history")
+def get_stock_history(stock_code: str, period: str = "30d", interval: str = "1d"):
+    quote = get_quote(stock_code)
+    points = build_history(quote["ticker"], period, interval)
+
+    return {
+        "code": stock_code,
+        "symbol": quote["symbol"],
+        "market": quote["market"],
+        "currency": quote["currency"],
+        "name": get_chinese_name(stock_code, quote["info"]),
+        "price": quote["price"],
+        "open": quote["open"],
+        "high": quote["high"],
+        "low": quote["low"],
+        "prev_close": quote["prev_close"],
+        "volume": quote["volume"],
+        "points": points,
+        "period": period,
+        "interval": interval,
+    }
+
+
+@app.get("/stock/{stock_code}/news")
+def get_stock_news(stock_code: str):
+    quote = get_quote(stock_code)
+    return {
+        "code": stock_code,
+        "symbol": quote["symbol"],
+        "name": get_chinese_name(stock_code, quote["info"]),
+        "news": get_news_items(quote["symbol"]),
+    }
+
+
+@app.get("/stock/{stock_code}/events")
+def get_stock_events(stock_code: str):
+    quote = get_quote(stock_code)
+    return {
+        "code": stock_code,
+        "symbol": quote["symbol"],
+        "name": get_chinese_name(stock_code, quote["info"]),
+        "events": get_company_events(quote["ticker"]),
+    }
+
+
+@app.get("/stock/{stock_code}/flows")
+def get_stock_flows(stock_code: str):
+    quote = get_quote(stock_code)
+
+    if quote["market"] not in ["上市", "上櫃"]:
+        return {
+            "code": stock_code,
+            "symbol": quote["symbol"],
+            "market": quote["market"],
+            "available": False,
+            "message": "外資/投信/融資資料目前僅支援台股。",
+            "points": [],
+        }
+
+    if quote["market"] == "上櫃":
+        return {
+            "code": stock_code,
+            "symbol": quote["symbol"],
+            "market": quote["market"],
+            "available": False,
+            "message": "上櫃法人/融資資料需另接 TPEx，下一版可補。",
+            "points": [],
+        }
+
+    return {
+        "code": stock_code,
+        "symbol": quote["symbol"],
+        "market": quote["market"],
+        "available": True,
+        "message": "資料來源：TWSE，通常為盤後資料。",
+        "points": get_twse_flow_trend(stock_code),
     }
 
 
