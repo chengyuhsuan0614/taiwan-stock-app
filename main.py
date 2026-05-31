@@ -165,7 +165,17 @@ def resolve_ticker(stock_code: str):
     台股 Yahoo Finance 格式：
     上市通常是 2330.TW，上櫃通常是 8069.TWO。
     這裡會自動兩邊都試，讓新增股票比較不會卡住。
+    美股則直接使用 AAPL / TSLA / NVDA 這種原始代號。
     """
+    stock_code = stock_code.strip().upper()
+
+    if any(ch.isalpha() for ch in stock_code):
+        ticker = yf.Ticker(stock_code)
+        history = ticker.history(period="5d")
+        if not history.empty:
+            return ticker, stock_code, "美股", history
+        raise HTTPException(status_code=404, detail=f"找不到股票代號 {stock_code}")
+
     for suffix, market in [(".TW", "上市"), (".TWO", "上櫃")]:
         symbol = f"{stock_code}{suffix}"
         ticker = yf.Ticker(symbol)
@@ -200,6 +210,7 @@ def get_quote(stock_code: str) -> dict:
         "symbol": symbol,
         "market": market,
         "info": info,
+        "currency": info.get("currency", "TWD" if market in ["上市", "上櫃"] else "USD"),
         "history": history,
         "price": price,
         "prev_close": prev_close,
@@ -292,6 +303,7 @@ def get_stock(stock_code: str):
         "code": stock_code,
         "symbol": quote["symbol"],
         "market": quote["market"],
+        "currency": quote["currency"],
         "name": get_chinese_name(stock_code, info),
         "price": quote["price"],
         "open": quote["open"],
@@ -316,6 +328,7 @@ def get_intraday(stock_code: str):
         "code": stock_code,
         "symbol": quote["symbol"],
         "market": quote["market"],
+        "currency": quote["currency"],
         "name": get_chinese_name(stock_code, quote["info"]),
         "price": quote["price"],
         "open": quote["open"],
@@ -347,6 +360,7 @@ def get_watchlist(codes: str):
                 "change_pct": 0,
                 "volume": 0,
                 "market": "",
+                "currency": "",
                 "error": True,
             })
             continue
@@ -361,6 +375,7 @@ def get_watchlist(codes: str):
             "code": code,
             "symbol": quote["symbol"],
             "market": quote["market"],
+            "currency": quote["currency"],
             "name": get_chinese_name(code, info),
             "price": current,
             "change": change,
