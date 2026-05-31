@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 
 import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 from fastapi import HTTPException
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -284,6 +285,9 @@ def build_history(ticker, period: str, interval: str) -> list[dict]:
 
 
 def get_news_items(symbol: str) -> list[dict]:
+    if symbol.endswith(".TW") or symbol.endswith(".TWO"):
+        return get_tw_yahoo_news(symbol)
+
     url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(symbol)}&region=US&lang=en-US"
     try:
         response = requests.get(url, timeout=8)
@@ -300,6 +304,41 @@ def get_news_items(symbol: str) -> list[dict]:
             "published": (item.findtext("pubDate") or "").strip(),
             "source": "Yahoo Finance",
         })
+    return items
+
+
+def get_tw_yahoo_news(symbol: str) -> list[dict]:
+    url = f"https://tw.stock.yahoo.com/quote/{quote_plus(symbol)}/news"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=8)
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    items = []
+    seen = set()
+    for link in soup.find_all("a", href=True):
+        title = " ".join(link.get_text(" ", strip=True).split())
+        href = link["href"]
+        if len(title) < 12:
+            continue
+        if title in seen:
+            continue
+        if "news" not in href and "tw.news.yahoo.com" not in href:
+            continue
+        if href.startswith("/"):
+            href = f"https://tw.stock.yahoo.com{href}"
+        items.append({
+            "title": title,
+            "link": href,
+            "published": "",
+            "source": "Yahoo股市",
+        })
+        seen.add(title)
+        if len(items) >= 8:
+            break
     return items
 
 
@@ -425,6 +464,83 @@ def get_twse_flow_trend(stock_code: str) -> list[dict]:
         })
 
     return list(reversed(points))
+
+
+def get_financial_trends(stock_code: str, quote: dict) -> dict:
+    revenue_points = get_tw_monthly_revenue(stock_code, quote["symbol"])
+    quarterly = get_yfinance_quarterly_financials(quote["ticker"])
+    return {
+        "revenue": revenue_points,
+        "gross_margin": quarterly["gross_margin"],
+        "eps": quarterly["eps"],
+        "message": "月營收優先抓 Yahoo 台股；毛利率/EPS 取 Yahoo Finance 季資料。資料源不足時會留空。",
+    }
+
+
+def get_tw_monthly_revenue(stock_code: str, symbol: str) -> list[dict]:
+    if not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
+        return []
+
+    url = f"https://tw.stock.yahoo.com/quote/{quote_plus(symbol)}/revenue"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=8)
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    tokens = text.replace(",", "").split()
+    points = []
+
+    for idx, token in enumerate(tokens):
+        if "/" not in token:
+            continue
+        parts = token.split("/")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            continue
+        year, month = parts
+        if len(year) not in [3, 4] or len(month) not in [1, 2]:
+            continue
+        for next_token in tokens[idx + 1: idx + 8]:
+            value = to_int(next_token, None)
+            if value and value > 0:
+                points.append({
+                    "date": token,
+                    "value": value,
+                })
+                break
+        if len(points) >= 12:
+            break
+
+    return list(reversed(points[:12]))
+
+
+def get_yfinance_quarterly_financials(ticker) -> dict:
+    gross_margin = []
+    eps = []
+    try:
+        financials = ticker.quarterly_financials
+        income_stmt = ticker.quarterly_income_stmt
+        df = income_stmt if hasattr(income_stmt, "empty") and not income_stmt.empty else financials
+        if hasattr(df, "empty") and not df.empty:
+            for col in list(df.columns)[:4]:
+                label = col.strftime("%Y/%m") if hasattr(col, "strftime") else str(col)[:7]
+                total_revenue = to_float(df.loc["Total Revenue", col] if "Total Revenue" in df.index else 0)
+                gross_profit = to_float(df.loc["Gross Profit", col] if "Gross Profit" in df.index else 0)
+                net_income = to_float(df.loc["Net Income", col] if "Net Income" in df.index else 0)
+                shares = to_float(df.loc["Diluted Average Shares", col] if "Diluted Average Shares" in df.index else 0)
+                if total_revenue and gross_profit:
+                    gross_margin.append({"date": label, "value": round(gross_profit / total_revenue * 100, 2)})
+                if net_income and shares:
+                    eps.append({"date": label, "value": round(net_income / shares, 2)})
+    except Exception:
+        pass
+
+    return {
+        "gross_margin": list(reversed(gross_margin)),
+        "eps": list(reversed(eps)),
+    }
 
 
 # 建立 API 伺服器
@@ -591,6 +707,18 @@ def get_stock_flows(stock_code: str):
         "available": True,
         "message": "資料來源：TWSE，通常為盤後資料。",
         "points": get_twse_flow_trend(stock_code),
+    }
+
+
+@app.get("/stock/{stock_code}/financials")
+def get_stock_financials(stock_code: str):
+    quote = get_quote(stock_code)
+    return {
+        "code": stock_code,
+        "symbol": quote["symbol"],
+        "market": quote["market"],
+        "name": get_chinese_name(stock_code, quote["info"]),
+        **get_financial_trends(stock_code, quote),
     }
 
 
