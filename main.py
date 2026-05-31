@@ -3,6 +3,7 @@
 
 import csv
 import io
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -284,9 +285,9 @@ def build_history(ticker, period: str, interval: str) -> list[dict]:
     return points
 
 
-def get_news_items(symbol: str) -> list[dict]:
+def get_news_items(symbol: str, company_name: str = "", stock_code: str = "") -> list[dict]:
     if symbol.endswith(".TW") or symbol.endswith(".TWO"):
-        return get_tw_yahoo_news(symbol)
+        return get_tw_yahoo_news(symbol, company_name, stock_code)
 
     url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(symbol)}&region=US&lang=en-US"
     try:
@@ -297,17 +298,52 @@ def get_news_items(symbol: str) -> list[dict]:
         return []
 
     items = []
-    for item in root.findall("./channel/item")[:8]:
+    keywords = build_news_keywords(company_name, stock_code, symbol)
+    for item in root.findall("./channel/item")[:20]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if keywords and not text_has_keyword(title, keywords):
+            continue
         items.append({
-            "title": (item.findtext("title") or "").strip(),
-            "link": (item.findtext("link") or "").strip(),
+            "title": title,
+            "link": link,
             "published": (item.findtext("pubDate") or "").strip(),
             "source": "Yahoo Finance",
         })
+        if len(items) >= 8:
+            break
     return items
 
 
-def get_tw_yahoo_news(symbol: str) -> list[dict]:
+def build_news_keywords(company_name: str, stock_code: str, symbol: str) -> list[str]:
+    keywords = []
+    for item in [company_name, stock_code, symbol.replace(".TW", "").replace(".TWO", "")]:
+        item = str(item or "").strip()
+        if item and item != "查無資料" and item not in keywords:
+            keywords.append(item)
+    if company_name:
+        short = re.sub(r"(股份有限公司|有限公司|公司|Corporation|Company Limited|Inc\.)", "", company_name).strip()
+        if len(short) >= 2 and short not in keywords:
+            keywords.append(short)
+    return keywords
+
+
+def text_has_keyword(text: str, keywords: list[str]) -> bool:
+    normalized = str(text or "").lower()
+    return any(str(keyword).lower() in normalized for keyword in keywords if keyword)
+
+
+def article_mentions_company(url: str, keywords: list[str]) -> bool:
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+        response.raise_for_status()
+    except Exception:
+        return False
+    text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    return text_has_keyword(text, keywords)
+
+
+def get_tw_yahoo_news(symbol: str, company_name: str = "", stock_code: str = "") -> list[dict]:
     url = f"https://tw.stock.yahoo.com/quote/{quote_plus(symbol)}/news"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -319,6 +355,7 @@ def get_tw_yahoo_news(symbol: str) -> list[dict]:
     soup = BeautifulSoup(response.text, "html.parser")
     items = []
     seen = set()
+    keywords = build_news_keywords(company_name, stock_code, symbol)
     for link in soup.find_all("a", href=True):
         title = " ".join(link.get_text(" ", strip=True).split())
         href = link["href"]
@@ -330,6 +367,8 @@ def get_tw_yahoo_news(symbol: str) -> list[dict]:
             continue
         if href.startswith("/"):
             href = f"https://tw.stock.yahoo.com{href}"
+        if keywords and not text_has_keyword(title, keywords) and not article_mentions_company(href, keywords):
+            continue
         items.append({
             "title": title,
             "link": href,
@@ -342,7 +381,80 @@ def get_tw_yahoo_news(symbol: str) -> list[dict]:
     return items
 
 
-def get_company_events(ticker) -> list[dict]:
+EVENT_TYPE_MAP = {
+    "Earnings Date": "財報公布日",
+    "Ex-Dividend Date": "除息日",
+    "Dividend Date": "股利發放日",
+    "Last Split Date": "股票分割日",
+    "法說會": "法說會",
+    "股東會": "股東會",
+    "除權息": "除權息",
+    "停券": "停券",
+    "暫停交易": "暫停交易",
+    "恢復交易": "恢復交易",
+    "減資": "減資",
+}
+
+
+def zh_event_type(name: str) -> str:
+    name = str(name or "").strip()
+    return EVENT_TYPE_MAP.get(name, name.replace("_", " ") or "公司事件")
+
+
+def get_tw_yahoo_events(symbol: str) -> list[dict]:
+    if not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
+        return []
+
+    url = f"https://tw.stock.yahoo.com/quote/{quote_plus(symbol)}/calendar"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=8)
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    tokens = text.split()
+    events = []
+    current_year = ""
+    weekdays = {"週一", "週二", "週三", "週四", "週五", "週六", "週日"}
+
+    for idx, token in enumerate(tokens):
+        if re.fullmatch(r"20\d{2}", token) and idx + 1 < len(tokens) and tokens[idx + 1] == "年":
+            current_year = token
+            continue
+        if not current_year or not re.fullmatch(r"\d{1,2}/\d{1,2}", token):
+            continue
+
+        event_idx = idx + 1
+        if event_idx < len(tokens) and tokens[event_idx] in weekdays:
+            event_idx += 1
+        if event_idx >= len(tokens):
+            continue
+
+        event_type = tokens[event_idx]
+        if event_type in ["加入自選", "網友也在看", "股名/股號"]:
+            break
+        if event_type not in EVENT_TYPE_MAP and len(event_type) > 8:
+            continue
+
+        month, day = token.split("/")
+        events.append({
+            "type": zh_event_type(event_type),
+            "date": f"{current_year}-{int(month):02d}-{int(day):02d}",
+            "note": "資料來源：Yahoo股市行事曆",
+        })
+        if len(events) >= 12:
+            break
+
+    return events
+
+
+def get_company_events(ticker, symbol: str = "") -> list[dict]:
+    yahoo_tw_events = get_tw_yahoo_events(symbol)
+    if yahoo_tw_events:
+        return yahoo_tw_events
+
     events = []
 
     try:
@@ -350,16 +462,16 @@ def get_company_events(ticker) -> list[dict]:
         if isinstance(calendar, dict):
             for key, value in calendar.items():
                 events.append({
-                    "type": str(key),
+                    "type": zh_event_type(str(key)),
                     "date": str(value),
-                    "note": "Yahoo Finance calendar",
+                    "note": "資料來源：Yahoo Finance 行事曆",
                 })
         elif hasattr(calendar, "empty") and not calendar.empty:
             for key, value in calendar.to_dict().items():
                 events.append({
-                    "type": str(key),
+                    "type": zh_event_type(str(key)),
                     "date": str(value),
-                    "note": "Yahoo Finance calendar",
+                    "note": "資料來源：Yahoo Finance 行事曆",
                 })
     except Exception:
         pass
@@ -371,7 +483,7 @@ def get_company_events(ticker) -> list[dict]:
                 events.append({
                     "type": "財報/法說相關日期",
                     "date": date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date),
-                    "note": "Yahoo Finance earnings calendar",
+                    "note": "資料來源：Yahoo Finance 財報行事曆",
                 })
     except Exception:
         pass
@@ -468,12 +580,14 @@ def get_twse_flow_trend(stock_code: str) -> list[dict]:
 
 def get_financial_trends(stock_code: str, quote: dict) -> dict:
     revenue_points = get_tw_monthly_revenue(stock_code, quote["symbol"])
-    quarterly = get_yfinance_quarterly_financials(quote["ticker"])
+    quarterly = get_tw_yahoo_quarterly_financials(quote["symbol"])
+    if not quarterly["gross_margin"] and not quarterly["eps"]:
+        quarterly = get_yfinance_quarterly_financials(quote["ticker"])
     return {
         "revenue": revenue_points,
         "gross_margin": quarterly["gross_margin"],
         "eps": quarterly["eps"],
-        "message": "月營收優先抓 Yahoo 台股；毛利率/EPS 取 Yahoo Finance 季資料。資料源不足時會留空。",
+        "message": "財務資料來源：Yahoo股市公開頁面；月營收為單月合併營收，毛利率以營業毛利/營業收入計算，EPS 為單季每股盈餘。",
     }
 
 
@@ -489,31 +603,113 @@ def get_tw_monthly_revenue(stock_code: str, symbol: str) -> list[dict]:
     except Exception:
         return []
 
-    text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+    text = normalize_page_text(response.text)
     tokens = text.replace(",", "").split()
     points = []
 
     for idx, token in enumerate(tokens):
-        if "/" not in token:
+        if not re.fullmatch(r"20\d{2}/\d{1,2}", token):
             continue
-        parts = token.split("/")
-        if len(parts) != 2 or not all(part.isdigit() for part in parts):
-            continue
-        year, month = parts
-        if len(year) not in [3, 4] or len(month) not in [1, 2]:
-            continue
-        for next_token in tokens[idx + 1: idx + 8]:
-            value = to_int(next_token, None)
-            if value and value > 0:
-                points.append({
-                    "date": token,
-                    "value": value,
-                })
-                break
+        value = to_int(tokens[idx + 1] if idx + 1 < len(tokens) else "", None)
+        if value and value > 0:
+            points.append({"date": token, "value": value})
         if len(points) >= 12:
             break
 
-    return list(reversed(points[:12]))
+    return list(reversed(points))
+
+
+def normalize_page_text(html: str) -> str:
+    return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+
+
+def fetch_tw_stock_page(symbol: str, path: str) -> str:
+    if not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
+        return ""
+    url = f"https://tw.stock.yahoo.com/quote/{quote_plus(symbol)}/{path}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=8)
+        response.raise_for_status()
+        return normalize_page_text(response.text)
+    except Exception:
+        return ""
+
+
+def collect_numeric_tokens(tokens: list[str], start_idx: int, limit: int) -> list[float]:
+    values = []
+    for token in tokens[start_idx:]:
+        if len(values) >= limit:
+            break
+        cleaned = token.replace(",", "")
+        if re.fullmatch(r"-?\d+(\.\d+)?%?", cleaned):
+            values.append(to_float(cleaned.replace("%", "")))
+    return values
+
+
+def get_tw_yahoo_quarterly_financials(symbol: str) -> dict:
+    if not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
+        return {"gross_margin": [], "eps": []}
+
+    income_text = fetch_tw_stock_page(symbol, "income-statement")
+    eps_text = fetch_tw_stock_page(symbol, "eps")
+    gross_margin = parse_tw_yahoo_gross_margin(income_text)
+    eps = parse_tw_yahoo_eps(eps_text)
+    return {"gross_margin": gross_margin, "eps": eps}
+
+
+def parse_quarter_labels(tokens: list[str], limit: int = 8) -> list[str]:
+    labels = []
+    for idx in range(len(tokens) - 1):
+        if re.fullmatch(r"20\d{2}", tokens[idx]) and re.fullmatch(r"Q[1-4]", tokens[idx + 1]):
+            labels.append(f"{tokens[idx]} {tokens[idx + 1]}")
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def parse_tw_yahoo_gross_margin(text: str) -> list[dict]:
+    tokens = text.replace(",", "").split()
+    try:
+        date_idx = tokens.index("年度/月份")
+        revenue_idx = tokens.index("營業收入", date_idx)
+        gross_idx = tokens.index("營業毛利", revenue_idx)
+    except ValueError:
+        return []
+
+    labels = parse_quarter_labels(tokens[date_idx:revenue_idx], 8)
+    if not labels:
+        return []
+
+    count = min(len(labels), 8)
+    revenues = collect_numeric_tokens(tokens, revenue_idx + 1, count)
+    gross_profits = collect_numeric_tokens(tokens, gross_idx + 1, count)
+    points = []
+    for label, revenue, gross_profit in zip(labels, revenues, gross_profits):
+        if revenue:
+            points.append({"date": label, "value": round(gross_profit / revenue * 100, 2)})
+    return list(reversed(points[:4]))
+
+
+def parse_tw_yahoo_eps(text: str) -> list[dict]:
+    tokens = text.replace(",", "").split()
+    try:
+        start_idx = tokens.index("年度/季別")
+    except ValueError:
+        return []
+
+    points = []
+    idx = start_idx + 1
+    while idx < len(tokens) - 2 and len(points) < 8:
+        if re.fullmatch(r"20\d{2}", tokens[idx]) and re.fullmatch(r"Q[1-4]", tokens[idx + 1]):
+            value = to_float(tokens[idx + 2].replace(",", ""), None)
+            if value is not None:
+                points.append({"date": f"{tokens[idx]} {tokens[idx + 1]}", "value": value})
+            idx += 5
+            continue
+        idx += 1
+
+    return list(reversed(points[:4]))
 
 
 def get_yfinance_quarterly_financials(ticker) -> dict:
@@ -540,6 +736,69 @@ def get_yfinance_quarterly_financials(ticker) -> dict:
     return {
         "gross_margin": list(reversed(gross_margin)),
         "eps": list(reversed(eps)),
+    }
+
+
+RANK_URLS = {
+    "volume": "https://tw.stock.yahoo.com/rank/volume?exchange=TAI",
+    "change-up": "https://tw.stock.yahoo.com/rank/change-up?exchange=TAI",
+    "change-down": "https://tw.stock.yahoo.com/rank/change-down?exchange=TAI",
+}
+
+
+def get_yahoo_rank(rank_type: str) -> dict:
+    if rank_type not in RANK_URLS:
+        raise HTTPException(status_code=404, detail="Unknown rank type")
+
+    labels = {
+        "volume": "成交量排行",
+        "change-up": "漲幅排行",
+        "change-down": "跌幅排行",
+    }
+    url = RANK_URLS[rank_type]
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        response.raise_for_status()
+    except Exception:
+        return {"type": rank_type, "title": labels[rank_type], "items": [], "source": "Yahoo股市"}
+
+    tokens = normalize_page_text(response.text).replace(",", "").split()
+    items = []
+    for idx, token in enumerate(tokens):
+        if not re.fullmatch(r"\d{4}\.TW", token):
+            continue
+        if idx < 1 or idx + 7 >= len(tokens):
+            continue
+
+        code = token.replace(".TW", "")
+        name = tokens[idx - 1]
+        price = to_float(tokens[idx + 1], None)
+        change = to_float(tokens[idx + 2], None)
+        change_pct = to_float(tokens[idx + 3].replace("%", ""), None)
+        volume = to_int(tokens[idx + 7], None)
+
+        if price is None or change is None or change_pct is None or volume is None:
+            continue
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", name):
+            continue
+
+        items.append({
+            "rank": len(items) + 1,
+            "code": code,
+            "name": name,
+            "price": price,
+            "change": change,
+            "change_pct": change_pct,
+            "volume": volume,
+        })
+        if len(items) >= 30:
+            break
+
+    return {
+        "type": rank_type,
+        "title": labels[rank_type],
+        "source": "Yahoo股市",
+        "items": items,
     }
 
 
@@ -580,6 +839,11 @@ def stock_name(stock_code: str):
         "market": market,
         "symbol": symbol,
     }
+
+
+@app.get("/rank/{rank_type}")
+def stock_rank(rank_type: str):
+    return get_yahoo_rank(rank_type)
 
 
 # 第二個 API：查詢單一股票資料
@@ -633,21 +897,48 @@ def get_intraday(stock_code: str):
 
 @app.get("/stock/{stock_code}/history")
 def get_stock_history(stock_code: str, period: str = "30d", interval: str = "1d"):
-    quote = get_quote(stock_code)
-    points = build_history(quote["ticker"], period, interval)
+    stock_code = stock_code.strip().upper()
+    candidates = [(stock_code, "美股")] if any(ch.isalpha() for ch in stock_code) else [
+        (f"{stock_code}.TW", "上市"),
+        (f"{stock_code}.TWO", "上櫃"),
+    ]
+
+    ticker = None
+    symbol = ""
+    market = ""
+    points = []
+    for candidate_symbol, candidate_market in candidates:
+        candidate_ticker = yf.Ticker(candidate_symbol)
+        try:
+            candidate_points = build_history(candidate_ticker, period, interval)
+        except Exception:
+            candidate_points = []
+        if candidate_points:
+            ticker = candidate_ticker
+            symbol = candidate_symbol
+            market = candidate_market
+            points = candidate_points
+            break
+
+    if not points or ticker is None:
+        raise HTTPException(status_code=404, detail=f"找不到股票代號 {stock_code}")
+
+    last = points[-1]
+    prev = points[-2] if len(points) >= 2 else last
+    currency = "USD" if market == "美股" else "TWD"
 
     return {
         "code": stock_code,
-        "symbol": quote["symbol"],
-        "market": quote["market"],
-        "currency": quote["currency"],
-        "name": get_chinese_name(stock_code, quote["info"]),
-        "price": quote["price"],
-        "open": quote["open"],
-        "high": quote["high"],
-        "low": quote["low"],
-        "prev_close": quote["prev_close"],
-        "volume": quote["volume"],
+        "symbol": symbol,
+        "market": market,
+        "currency": currency,
+        "name": load_stock_name_map().get(stock_code, stock_code),
+        "price": last["price"],
+        "open": last["open"],
+        "high": last["high"],
+        "low": last["low"],
+        "prev_close": prev["price"],
+        "volume": last["volume"],
         "points": points,
         "period": period,
         "interval": interval,
@@ -657,11 +948,12 @@ def get_stock_history(stock_code: str, period: str = "30d", interval: str = "1d"
 @app.get("/stock/{stock_code}/news")
 def get_stock_news(stock_code: str):
     quote = get_quote(stock_code)
+    company_name = get_chinese_name(stock_code, quote["info"])
     return {
         "code": stock_code,
         "symbol": quote["symbol"],
-        "name": get_chinese_name(stock_code, quote["info"]),
-        "news": get_news_items(quote["symbol"]),
+        "name": company_name,
+        "news": get_news_items(quote["symbol"], company_name, stock_code),
     }
 
 
@@ -672,7 +964,7 @@ def get_stock_events(stock_code: str):
         "code": stock_code,
         "symbol": quote["symbol"],
         "name": get_chinese_name(stock_code, quote["info"]),
-        "events": get_company_events(quote["ticker"]),
+        "events": get_company_events(quote["ticker"], quote["symbol"]),
     }
 
 
