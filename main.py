@@ -7,6 +7,7 @@ from functools import lru_cache
 
 import requests
 import yfinance as yf
+from fastapi import HTTPException
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -141,6 +142,106 @@ def get_chinese_name(stock_code: str, info: dict) -> str:
     return info.get("shortName") or info.get("longName") or "查無資料"
 
 
+def to_float(value, default=0):
+    try:
+        if value is None:
+            return default
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_ticker(stock_code: str):
+    """
+    台股 Yahoo Finance 格式：
+    上市通常是 2330.TW，上櫃通常是 8069.TWO。
+    這裡會自動兩邊都試，讓新增股票比較不會卡住。
+    """
+    for suffix, market in [(".TW", "上市"), (".TWO", "上櫃")]:
+        symbol = f"{stock_code}{suffix}"
+        ticker = yf.Ticker(symbol)
+        try:
+            history = ticker.history(period="5d")
+            if not history.empty:
+                return ticker, symbol, market, history
+        except Exception:
+            continue
+    raise HTTPException(status_code=404, detail=f"找不到股票代號 {stock_code}")
+
+
+def get_quote(stock_code: str) -> dict:
+    ticker, symbol, market, history = resolve_ticker(stock_code)
+    try:
+        info = ticker.info
+    except Exception:
+        info = {}
+
+    last_row = history.iloc[-1] if not history.empty else None
+    prev_row = history.iloc[-2] if len(history) >= 2 else last_row
+
+    price = to_float(info.get("currentPrice")) or to_float(last_row["Close"] if last_row is not None else 0)
+    prev_close = to_float(info.get("previousClose")) or to_float(prev_row["Close"] if prev_row is not None else 0)
+    open_price = to_float(info.get("open")) or to_float(last_row["Open"] if last_row is not None else 0)
+    high = to_float(info.get("dayHigh")) or to_float(last_row["High"] if last_row is not None else 0)
+    low = to_float(info.get("dayLow")) or to_float(last_row["Low"] if last_row is not None else 0)
+    volume = to_int(info.get("volume")) or to_int(last_row["Volume"] if last_row is not None else 0)
+
+    return {
+        "ticker": ticker,
+        "symbol": symbol,
+        "market": market,
+        "info": info,
+        "history": history,
+        "price": price,
+        "prev_close": prev_close,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "volume": volume,
+    }
+
+
+def build_daily_history(history) -> list[dict]:
+    history_list = []
+    for date, row in history.iterrows():
+        history_list.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "open": to_float(row["Open"]),
+            "high": to_float(row["High"]),
+            "low": to_float(row["Low"]),
+            "close": to_float(row["Close"]),
+            "volume": to_int(row["Volume"])
+        })
+    return history_list
+
+
+def build_intraday_history(ticker) -> list[dict]:
+    intraday = ticker.history(period="1d", interval="1m")
+    points = []
+    for date, row in intraday.iterrows():
+        close = to_float(row["Close"])
+        if close <= 0:
+            continue
+        points.append({
+            "time": date.strftime("%H:%M"),
+            "price": close,
+            "open": to_float(row["Open"]),
+            "high": to_float(row["High"]),
+            "low": to_float(row["Low"]),
+            "volume": to_int(row["Volume"]),
+        })
+    return points
+
+
 # 建立 API 伺服器
 app = FastAPI()
 
@@ -162,9 +263,21 @@ def home():
 # 查詢股票中文名稱清單載入狀態
 @app.get("/stock-name/{stock_code}")
 def stock_name(stock_code: str):
+    name = load_stock_name_map().get(stock_code)
+    try:
+        quote = get_quote(stock_code)
+        name = get_chinese_name(stock_code, quote["info"])
+        market = quote["market"]
+        symbol = quote["symbol"]
+    except HTTPException:
+        market = ""
+        symbol = ""
+
     return {
         "code": stock_code,
-        "name": load_stock_name_map().get(stock_code, "查無資料"),
+        "name": name or "查無資料",
+        "market": market,
+        "symbol": symbol,
     }
 
 
@@ -172,33 +285,46 @@ def stock_name(stock_code: str):
 # 使用方式：瀏覽器輸入 http://localhost:8000/stock/2330
 @app.get("/stock/{stock_code}")
 def get_stock(stock_code: str):
-    ticker = yf.Ticker(f"{stock_code}.TW")
-    info = ticker.info
-    history = ticker.history(period="5d")
-
-    # 整理最近5天的資料
-    history_list = []
-    for date, row in history.iterrows():
-        history_list.append({
-            "date": date.strftime("%Y-%m-%d"),
-            "open": round(row["Open"], 2),
-            "high": round(row["High"], 2),
-            "low": round(row["Low"], 2),
-            "close": round(row["Close"], 2),
-            "volume": int(row["Volume"])
-        })
+    quote = get_quote(stock_code)
+    info = quote["info"]
 
     return {
         "code": stock_code,
+        "symbol": quote["symbol"],
+        "market": quote["market"],
         "name": get_chinese_name(stock_code, info),
-        "price": info.get("currentPrice", 0),
-        "open": info.get("open", 0),
-        "high": info.get("dayHigh", 0),
-        "low": info.get("dayLow", 0),
-        "prev_close": info.get("previousClose", 0),
-        "volume": info.get("volume", 0),
-        "pe_ratio": info.get("trailingPE", 0),
-        "history": history_list
+        "price": quote["price"],
+        "open": quote["open"],
+        "high": quote["high"],
+        "low": quote["low"],
+        "prev_close": quote["prev_close"],
+        "volume": quote["volume"],
+        "pe_ratio": info.get("trailingPE", 0) or 0,
+        "history": build_daily_history(quote["history"])
+    }
+
+
+@app.get("/stock/{stock_code}/intraday")
+def get_intraday(stock_code: str):
+    quote = get_quote(stock_code)
+    points = build_intraday_history(quote["ticker"])
+
+    if points:
+        quote["price"] = points[-1]["price"]
+
+    return {
+        "code": stock_code,
+        "symbol": quote["symbol"],
+        "market": quote["market"],
+        "name": get_chinese_name(stock_code, quote["info"]),
+        "price": quote["price"],
+        "open": quote["open"],
+        "high": quote["high"],
+        "low": quote["low"],
+        "prev_close": quote["prev_close"],
+        "volume": quote["volume"],
+        "points": points,
+        "updated_at": points[-1]["time"] if points else "",
     }
 
 
@@ -210,15 +336,31 @@ def get_watchlist(codes: str):
     result = []
 
     for code in stock_list:
-        ticker = yf.Ticker(f"{code}.TW")
-        info = ticker.info
-        prev = info.get("previousClose", 0)
-        current = info.get("currentPrice", 0)
+        try:
+            quote = get_quote(code)
+        except HTTPException:
+            result.append({
+                "code": code,
+                "name": "查無資料",
+                "price": 0,
+                "change": 0,
+                "change_pct": 0,
+                "volume": 0,
+                "market": "",
+                "error": True,
+            })
+            continue
+
+        info = quote["info"]
+        prev = quote["prev_close"]
+        current = quote["price"]
         change = round(current - prev, 2)
         change_pct = round((change / prev * 100), 2) if prev else 0
 
         result.append({
             "code": code,
+            "symbol": quote["symbol"],
+            "market": quote["market"],
             "name": get_chinese_name(code, info),
             "price": current,
             "change": change,
